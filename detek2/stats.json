@@ -1,0 +1,14 @@
+{
+  "users": {
+    "6240600311": {
+      "username": "Khenzi017",
+      "total_detections": 1,
+      "today_detections": 1,
+      "last_date": "2026-10-12"
+    }
+  },
+  "global": {
+    "total_users": 1,
+    "total_detections": 1
+  }
+}
