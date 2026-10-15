@@ -50,6 +50,26 @@ SPEED_PATH = BASE_DIR / getattr(config, "SPEED_FILE", "speed.json")
 _cooldown_tracker = {}
 
 
+# ==================== DATABASE / BACA-TULIS JSON ====================
+# Diletakkan di bagian paling atas agar bisa dipakai oleh fungsi lain
+# (misalnya load_speed) saat modul pertama kali dimuat.
+
+def _load_json(path: Path, default: dict) -> dict:
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            pass
+    return default
+
+
+def _save_json(path: Path, data: dict):
+    try:
+        path.write_text(json.dumps(data, indent=2))
+    except Exception as e:
+        logger.error("Gagal simpan %s: %s", path, e)
+
+
 # ==================== KECEPATAN CEK (SETTINGAN OWNER) ====================
 
 def load_speed() -> dict:
@@ -247,22 +267,6 @@ async def kirim_atau_edit(query, teks, keyboard, keyboard_rich=None):
 
 
 # ==================== DATABASE ====================
-
-def _load_json(path: Path, default: dict) -> dict:
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except Exception:
-            pass
-    return default
-
-
-def _save_json(path: Path, data: dict):
-    try:
-        path.write_text(json.dumps(data, indent=2))
-    except Exception as e:
-        logger.error("Gagal simpan %s: %s", path, e)
-
 
 def load_stats() -> dict:
     return _load_json(STATS_PATH, {"users": {}, "global": {"total_users": 0, "total_detections": 0}})
