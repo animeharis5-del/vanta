@@ -240,6 +240,33 @@ _EMOJI_PATTERN = re.compile("|".join(re.escape(e) for e in sorted(_EMOJI_MAP, ke
 _TG_EMOJI_TAG_RE = re.compile(r'<tg-emoji\b[^>]*>(.*?)</tg-emoji>', re.S | re.I)
 
 
+# Hanya ID yang terbukti valid dipakai (lihat catatan TG_EMOJI_MAP di config.py).
+# ID lain membuat Telegram menampilkan tag mentah <tg-emoji emoji-id="...">
+# seperti pada kasus ⚠️ — jadi disaring di sini.
+_TG_EMOJI_VALID_IDS = {
+    "5123163417326126159",   # ✅ Success
+    "5121063440311386962",   # ❌ Cancel
+    "5447644880824181073",   # ⚠️ Warning
+    "5875450995332353523",   # 🚫 Slash
+    "5116159438062879454",   # ⏳ Loading
+    "5350595795508814391",   # ⏱ Clock
+    "5127377673596700174",   # 🔄 Refresh
+    "5890925363067886150",   # ✨ Sparkle
+    "5350613306090482956",   # 📊 Graph
+    "5776233299424843260",   # 🌐 Globe
+    "5226513232549664618",   # 🔷 Option
+    "5350725709679584478",   # ⚙️ Gear
+    "6028530359975548369",   # 💎 Diamond
+    "5258337316715373336",   # 🛟 Call
+    "5260399854500191689",   # 👤 User
+    "5944970130554359187",   # 👥 People
+    "5258503720928288433",   # ℹ️ Info
+    "5258476306152038031",   # 🔒 Lock
+    "5260268501515377807",   # 📣 Broadcast
+    "5260512129240276089",   # 📚 Books
+}
+
+
 def _customize_emojis(text: str):
     if not isinstance(text, str):
         return text, False
@@ -264,6 +291,16 @@ def _customize_emojis(text: str):
     if not _EMOJI_PATTERN:
         return text, False
 
+    # Jaring pengaman: buang tag <tg-emoji> dengan ID tak dikenal yang sudah
+    # terlanjur ada di teks (misal dari rich_html) agar tak tampil mentah.
+    def buang_id_asing(match):
+        if match.group(1) in _TG_EMOJI_VALID_IDS:
+            return match.group(0)
+        return match.group(2)
+
+    text = re.sub(r'<tg-emoji\b[^>]*emoji-id="(\d+)"[^>]*>(.*?)</tg-emoji>',
+                  buang_id_asing, text, flags=re.S | re.I)
+
     # Jangan mengubah emoji di tag custom yang sudah ada atau di blok pre/code.
     protected = []
     def protect(match):
@@ -277,7 +314,7 @@ def _customize_emojis(text: str):
         nonlocal changed
         emoji = match.group(0)
         emoji_id = str(_EMOJI_MAP.get(emoji, "")).strip()
-        if emoji_id.isdigit():
+        if emoji_id in _TG_EMOJI_VALID_IDS:
             changed = True
             return f'<tg-emoji emoji-id="{emoji_id}">{emoji}</tg-emoji>'
         return emoji
