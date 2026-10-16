@@ -75,33 +75,20 @@ BACKUP_INTERVAL_HOURS = 24    # tiap 6 jam
 BACKUP_FIRST_DELAY = 30       # backup pertama 30 detik setelah start
 
 
-# Telegram Premium Custom Emoji IDs (opsional).
-# Isi dengan ID custom emoji milik Anda; kosongkan jika belum punya.
-# Format ID harus angka dari Telegram, bukan emoji Unicode biasa.
-# Sumber referensi ID: pack_tgmacicons.txt (hanya ID yang terbukti valid dipakai bot).
-TG_EMOJI_MAP = {
-    # ── Daftar custom emoji yang TERBUKTI VALID dipakai bot (pack milik akun
-    #    premium bot). ID di luar daftar ini akan ditampilkan mentah oleh
-    #    Telegram sebagai <tg-emoji ...> — jadi jangan asal tempel ID. ──
-    '✅': '5123163417326126159',   # Success
-    '❌': '5121063440311386962',   # Cancel
-    '⚠️': '5447644880824181073',   # Warning
-    '🚫': '5875450995332353523',   # Slash (dilarang)
-    '⏳': '5116159438062879454',   # Loading
-    '⏱': '5350595795508814391',    # Clock (durasi)
-    '🔄': '5127377673596700174',   # Refresh
-    '✨': '5890925363067886150',   # Sparkle (sapaan)
-    '📊': '5350613306090482956',   # Graph (statistik)
-    '🌐': '5776233299424843260',   # Globe (network)
-    '🔷': '5226513232549664618',   # Option (menu)
-    '⚙️': '5350725709679584478',   # Gear (admin)
-    '💎': '6028530359975548369',   # Diamond (akun)
-    '🛟': '5258337316715373336',   # Call (bantuan)
-    '👤': '5260399854500191689',   # User (profil)
-    '👥': '5944970130554359187',   # People/referral
-    'ℹ️': '5258503720928288433',   # Info
-    '🔒': '5258476306152038031',   # Lock
-    '📣': '5260268501515377807',   # Megaphone (broadcast)
-    '📚': '5260512129240276089',   # Books (panduan)
-}
+# Telegram Premium Custom Emoji (OPSIONAL).
+#
+# MASALAH SEBELUMNYA: tag <tg-emoji emoji-id="..."> tampil MENTAH di chat
+# (contoh: <tg-emoji emoji-id="5447644880824181073">⚠️</tg-emoji>).
+# Penyebab: ID custom emoji hanya bisa dipakai oleh akun yang MEMILIKI pack
+# tersebut. ID hasil "extractor" dari pack orang lain (tgmacicons) tidak
+# dikenal server Telegram untuk akun bot, sehingga tag tidak dirender dan
+# client menampilkan teks mentahnya.
+#
+# Solusi: matikan custom emoji (pakai emoji Unicode standar -> selalu tampil
+# normal di semua device). Kalau nanti bot dipindah ke akun premium yang
+# memiliki pack sendiri, isi TG_EMOJI_MAP dengan ID milik akun itu dan set
+# TG_EMOJI_CUSTOM = True.
+TG_EMOJI_CUSTOM = False
+
+TG_EMOJI_MAP = {}
 

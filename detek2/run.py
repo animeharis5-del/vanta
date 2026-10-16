@@ -2,6 +2,7 @@ import asyncio
 import json
 import html
 import logging
+import os
 import random
 import re
 import time
@@ -55,6 +56,9 @@ _cooldown_tracker = {}
 # Diletakkan di bagian paling atas agar bisa dipakai oleh fungsi lain
 # (misalnya load_speed) saat modul pertama kali dimuat.
 
+METODE_TERSUMBUH = ["wa_old"]  # method yang didukung cek_wait.py saat ini
+
+
 def _load_json(path: Path, default: dict) -> dict:
     if path.exists():
         try:
@@ -69,6 +73,57 @@ def _save_json(path: Path, data: dict):
         path.write_text(json.dumps(data, indent=2))
     except Exception as e:
         logger.error("Gagal simpan %s: %s", path, e)
+
+
+# ==================== SETELAN BOT (SETTINGAN OWNER) ====================
+# Disimpan di bot_settings.json dan dibaca ulang setiap perintah ->
+# perubahan lewat perintah owner langsung berlaku tanpa restart bot.
+
+SETTINGS_PATH = BASE_DIR / getattr(config, "SETTINGS_FILE", "bot_settings.json")
+
+SETTINGS_DEFAULT = {
+    # Ulangi otomatis nomor yang gagal/error di dalam satu sesi detek
+    "retry_gagal": True,
+    "retry_maksimal": 2,
+    # Mode koneksi ke API WhatsApp:
+    #   "langsung" -> IP server langsung (cepat, tapi beberapa negara seperti
+    #                 Nepal/Sri Lanka sering diblokir dari IP datacenter)
+    #   "proxy"    -> pakai pool proxy gratis (butuh env WA_USE_PROXY=1 di
+    #                 container; jauh lebih andal untuk nomor luar negeri)
+    "mode_proxy": "langsung",
+    # Tampilkan tombol [🔄 ULANGI GAGAL] di hasil deteksi user
+    "tombol_ulang": True,
+}
+
+
+def load_settings() -> dict:
+    s = dict(SETTINGS_DEFAULT)
+    data = _load_json(SETTINGS_PATH, {})
+    for k in SETTINGS_DEFAULT:
+        if k in data:
+            s[k] = data[k]
+    try:
+        s["retry_gagal"] = bool(s["retry_gagal"])
+    except Exception:
+        s["retry_gagal"] = True
+    try:
+        s["retry_maksimal"] = min(5, max(0, int(s["retry_maksimal"])))
+    except (TypeError, ValueError):
+        s["retry_maksimal"] = SETTINGS_DEFAULT["retry_maksimal"]
+    if str(s["mode_proxy"]).lower() not in ("langsung", "proxy"):
+        s["mode_proxy"] = "langsung"
+    try:
+        s["tombol_ulang"] = bool(s["tombol_ulang"])
+    except Exception:
+        s["tombol_ulang"] = True
+    return s
+
+
+def save_settings(patch: dict) -> dict:
+    s = load_settings()
+    s.update(patch or {})
+    _save_json(SETTINGS_PATH, s)
+    return s
 
 
 # ==================== KECEPATAN CEK (SETTINGAN OWNER) ====================
@@ -152,12 +207,37 @@ def sinkronkan_semaphore():
     _sem_capacity = target
 
 
+def _set_mode_proxy(langsung: bool):
+    """Pasang mode koneksi ke API WhatsApp sesuai setelan owner.
+
+    "langsung" -> matikan semua env proxy (cek IP server apa adanya).
+    "proxy"    -> aktifkan WA_USE_PROXY supaya pakai pool proxy gratis;
+                  kalau env belum ada di container, set otomatis di sini.
+    """
+    if langsung:
+        for var in ("WA_USE_PROXY", "WA_PROXY", "WA_ampas"):
+            os.environ.pop(var, None)
+    else:
+        if not any(os.environ.get(v) for v in ("WA_USE_PROXY", "WA_PROXY", "WA_ampas")):
+            os.environ["WA_USE_PROXY"] = "1"
+
+
 # ==================== HELPER KIRIM PESAN ====================
 
-# Konversi emoji yang tersedia di pack pengguna menjadi Telegram Premium Custom Emoji.
-# Tombol inline dan callback alert tetap Unicode karena Bot API tidak mendukung entity di sana.
-_EMOJI_MAP = getattr(config, "TG_EMOJI_MAP", {}) or {}
+# Konversi emoji menjadi Telegram Premium Custom Emoji (OPSIONAL).
+# MATI secara default (config.TG_EMOJI_CUSTOM = False) karena ID custom emoji
+# hasil extractor dari pack orang lain tidak dikenal server Telegram untuk
+# akun bot -> client menampilkan tag MENTAH <tg-emoji emoji-id="...">⚠️</...>.
+# Dengan mode mati, semua pesan memakai emoji Unicode standar yang selalu
+# tampil normal di semua device.
+# Tombol inline dan callback alert memang selalu Unicode (Bot API tak
+# mendukung entity di sana).
+_EMOJI_CUSTOM_ON = bool(getattr(config, "TG_EMOJI_CUSTOM", False))
+_EMOJI_MAP = (getattr(config, "TG_EMOJI_MAP", {}) or {}) if _EMOJI_CUSTOM_ON else {}
 _EMOJI_PATTERN = re.compile("|".join(re.escape(e) for e in sorted(_EMOJI_MAP, key=len, reverse=True))) if _EMOJI_MAP else None
+
+# Pola tag <tg-emoji> yang mungkin tertinggal di teks (misal dari data lama).
+_TG_EMOJI_TAG_RE = re.compile(r'<tg-emoji\b[^>]*>(.*?)</tg-emoji>', re.S | re.I)
 
 
 # Hanya ID yang terbukti valid dipakai (lihat catatan TG_EMOJI_MAP di config.py).
@@ -188,7 +268,27 @@ _TG_EMOJI_VALID_IDS = {
 
 
 def _customize_emojis(text: str):
-    if not isinstance(text, str) or not _EMOJI_PATTERN:
+    if not isinstance(text, str):
+        return text, False
+
+    # Jaring pengaman SELALU jalan: buang tag <tg-emoji ...> ... </tg-emoji>
+    # yang tertinggal di teks (misal dari data/config lama) dan ganti dengan
+    # emoji Unicode polos tanpa kode tambahan apa pun, sehingga tidak pernah
+    # tampil mentah di chat.
+    def _buang_tag(m):
+        isi = m.group(1) or ""
+        # Tag nested (seharusnya tak ada) -> bersihkan juga.
+        isi = _TG_EMOJI_TAG_RE.sub(_buang_tag, isi)
+        # Kalau isinya masih mengandung markup/tag lain, ambil teks polosnya.
+        isi = re.sub(r"<[^>]*>", "", isi)
+        return isi.strip() or " "
+
+    if "<tg-emoji" in text.lower():
+        text = _TG_EMOJI_TAG_RE.sub(_buang_tag, text)
+    # Tag pembuka/closing <tg-emoji> yatim (tidak seimbang) -> buang tag-nya.
+    text = re.sub(r"</?tg-emoji\b[^>]*>", "", text, flags=re.I)
+
+    if not _EMOJI_PATTERN:
         return text, False
 
     # Jaring pengaman: buang tag <tg-emoji> dengan ID tak dikenal yang sudah
@@ -207,7 +307,6 @@ def _customize_emojis(text: str):
         protected.append(match.group(0))
         return f"VANTAPROTECTEDBLOCK{len(protected)-1}END"
 
-    text = re.sub(r"<tg-emoji\b[^>]*>.*?</tg-emoji>", protect, text, flags=re.S | re.I)
     text = re.sub(r"<(pre|code)\b[^>]*>.*?</\1\s*>", protect, text, flags=re.S | re.I)
 
     changed = False
@@ -222,7 +321,6 @@ def _customize_emojis(text: str):
 
     # Proses teks di antara tag HTML saja agar nama tag/atribut tidak tersentuh.
     parts = re.split(r"(<[^>]+>)", text)
-    in_tag = False
     for i, part in enumerate(parts):
         if part.startswith("<") and part.endswith(">"):
             continue
@@ -237,8 +335,9 @@ def _strip_custom_emoji(text):
     """Buang tag <tg-emoji> tapi pertahankan emoji Unicode-nya (jaring pengaman)."""
     if not isinstance(text, str):
         return text
-    return re.sub(r"<tg-emoji\b[^>]*>(.*?)</tg-emoji>", r"\1", text,
-                  flags=re.S | re.I)
+    out = _TG_EMOJI_TAG_RE.sub(r"\1", text)
+    out = re.sub(r"</?tg-emoji\b[^>]*>", "", out, flags=re.I)
+    return out
 
 
 def _entity_error(e):
@@ -571,28 +670,39 @@ def klasifikasi(r: dict) -> dict:
     return {"kategori": "error", "cooldown_detik": None, "alasan": reason or "unknown"}
 
 
+# Nomor yang dianggap GAGAL -> layak diulangi (bukan hasil final).
+KATEGORI_GAGAL = ("error", "ngambek")
+
+
 async def cek_satu_nomor_ringkas(nomor: str, methods: list) -> dict:
+    s_set = load_settings()
+    metode_coba = [m for m in (methods or []) if m] or METODE_TERSUMBUH
     hasil = {"nomor": nomor, "kategori": "error", "cooldown_detik": None, "alasan": None}
     ada_respons = False
 
-    for method in methods:
-        for attempt in range(3):
+    for method in metode_coba:
+        percobaan_maks = 3 + max(0, int(s_set["retry_maksimal"]))
+        for attempt in range(percobaan_maks):
             try:
                 r, _info = await detect(nomor, method)
                 ada_respons = True
             except CekBapaklu as e:
                 hasil["alasan"] = f"HTTP: {str(e)[:50]}"
+                await asyncio.sleep(1.0 + 0.5 * attempt)
                 continue
             except asyncio.TimeoutError:
                 hasil["alasan"] = "timeout"
+                await asyncio.sleep(1.0 + 0.5 * attempt)
                 continue
             except Exception as e:
                 hasil["alasan"] = f"{type(e).__name__}: {str(e)[:40]}"
+                await asyncio.sleep(1.0 + 0.5 * attempt)
                 continue
 
             k = klasifikasi(r)
 
-            if k["kategori"] == "ngambek" and attempt < 2:
+            # Ngambek / error sementara -> ulangi dengan jeda naik bertahap.
+            if k["kategori"] in KATEGORI_GAGAL and attempt < percobaan_maks - 1:
                 await asyncio.sleep(1.5 * (attempt + 1))
                 continue
 
@@ -612,6 +722,26 @@ async def cek_satu_nomor_ringkas(nomor: str, methods: list) -> dict:
         hasil["alasan"] = "gak support clone"
 
     return hasil
+
+
+def _ringkas_alasan(a) -> str:
+    """Rapikan alasan error yang muncul dari exception httpx/Python agar
+    mudah dibaca user (bukan nama class mentah seperti ConnectError)."""
+    s = str(a or "").strip()
+    if not s:
+        return "-"
+    ganti = {
+        "ConnectError": "koneksi ke server WA ditolak IP ini",
+        "TimeoutError": "server WA tidak merespon (timeout)",
+        "ReadTimeout": "server WA tidak merespon (timeout)",
+        "ConnectTimeout": "gagal koneksi ke server WA",
+        "SSLException": "masalah SSL saat koneksi",
+        "ProxyError": "proxy gagal dipakai",
+    }
+    for k, v in ganti.items():
+        if k in s:
+            return v + f" ({s[:60]})"
+    return s[:80]
 
 
 def susun_pesan(hasil_list, durasi, selesai=True, progress=None) -> str:
@@ -848,20 +978,29 @@ async def balas_rich(update, context, rich_html, keyboard=None,
                        reply_markup=keyboard, parse_mode="HTML")
 
 
-async def _edit_hasil(msg, rich_html):
+async def _edit_hasil(msg, rich_html, keyboard=None):
     """Edit pesan hasil deteksi: coba rich, fallback ke HTML biasa."""
     if len(rich_html) <= 4000:
         ok = await rich_ui.edit_rich(config.BOT_TOKEN, msg.chat.id,
                                      msg.message_id, rich_html)
         if ok:
+            if keyboard is not None:
+                # Rich tak memasang keyboard -> pasang via editMessageReplyMarkup.
+                try:
+                    await msg.edit_reply_markup(reply_markup=keyboard)
+                except Exception:
+                    pass
             return
     fb, _ = _customize_emojis(rich_ui.rich_ke_html(rich_html))
+    kwargs = {"parse_mode": "HTML"}
+    if keyboard is not None:
+        kwargs["reply_markup"] = keyboard
     try:
-        await msg.edit_text(fb[:4000], parse_mode="HTML")
+        await msg.edit_text(fb[:4000], **kwargs)
     except BadRequest as e:
         if not _entity_error(e):
             raise
-        await msg.edit_text(_strip_custom_emoji(fb)[:4000], parse_mode="HTML")
+        await msg.edit_text(_strip_custom_emoji(fb)[:4000], **kwargs)
 
 
 async def cek_force_join_atau_kirim(update: Update,
@@ -881,12 +1020,12 @@ async def cek_force_join_atau_kirim(update: Update,
 
 # ==================== ZHEE CHECKER UI ====================
 def tgemoji(key: str, fallback: str) -> str:
-    """Ambil ID custom emoji dari pack berdasarkan karakter fallback."""
-    emoji_map = getattr(config, "TG_EMOJI_MAP", {}) or {}
-    emoji_id = str(emoji_map.get(fallback, "")).strip()
-    # ID wajib ada di whitelist — kalau tidak, pakai emoji Unicode biasa
-    # supaya tidak muncul tag <tg-emoji ...> mentah di chat.
-    if emoji_id in _TG_EMOJI_VALID_IDS:
+    """Bungkus emoji dengan custom emoji ID bila mode custom aktif & ID valid.
+    Bila tidak, kembalikan emoji Unicode biasa (selalu tampil normal)."""
+    if not _EMOJI_CUSTOM_ON or not _EMOJI_MAP:
+        return fallback
+    emoji_id = str(_EMOJI_MAP.get(fallback, "")).strip()
+    if emoji_id.isdigit():
         return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
     return fallback
 
@@ -1315,12 +1454,29 @@ async def _proses_cek(update, context, nomor_list, user, setting,
         hasil_list = [hasil_by_idx[k] for k in sorted(hasil_by_idx)]
 
         durasi = time.time() - mulai
+
+        # ===== ULANGI OTOMATIS nomor yang masih GAGAL di dalam sesi ini =====
+        s_set = load_settings()
+        if s_set["retry_gagal"] and s_set["retry_maksimal"] > 0:
+            await _ulangi_nomor_gagal(hasil_by_idx, methods, user.id, msg,
+                                      mulai, total, idx_selesai)
+            hasil_list = [hasil_by_idx[k] for k in sorted(hasil_by_idx)]
+            durasi = time.time() - mulai
+
+        gagal_noms = [h["nomor"] for h in hasil_list
+                      if h["kategori"] in KATEGORI_GAGAL]
+        sesi_id = _simpan_sesi(user.id, list(hasil_by_idx.values()),
+                               methods if methods else METODE_TERSUMBUH)
+
         teks_akhir = susun_pesan(hasil_list, durasi, True)
 
         # ===== PESAN 1: hasil final =====
+        kb_final = None
+        if gagal_noms and s_set["tombol_ulang"]:
+            kb_final = _kb_ptb(spec_ulang(gagal_noms, sesi_id))
         if msg:
             try:
-                await _edit_hasil(msg, teks_akhir)
+                await _edit_hasil(msg, teks_akhir, keyboard=kb_final)
             except Exception:
                 pass
             fb_akhir, _ = _customize_emojis(rich_ui.rich_ke_html(teks_akhir))
@@ -1356,6 +1512,32 @@ async def _proses_cek(update, context, nomor_list, user, setting,
         update_stats(user.id, uname, len(hasil_list))
 
         logger.info(f"🔍 Deteksi oleh {user.id} ({uname}) - {len(hasil_list)} nomor ({tier})")
+
+
+async def _ulangi_nomor_gagal(hasil_by_idx, methods, user_id, msg,
+                              mulai, total, idx_selesai):
+    """Ulangi otomatis semua nomor berstatus error/ngambek (dipakai saat
+    owner mengaktifkan setelan retry_gagal)."""
+    ulang_target = [(i, h) for i, h in hasil_by_idx.items()
+                    if h["kategori"] in KATEGORI_GAGAL]
+    if not ulang_target:
+        return
+    logger.info("🔄 Ulang otomatis %d nomor gagal untuk user %s",
+                len(ulang_target), user_id)
+    for i, h in ulang_target:
+        baru = await cek_satu_nomor_ringkas(h["nomor"], methods)
+        # Jangan turunkan kualitas hasil lama kalau percobaan ulang makin buruk
+        if baru["kategori"] not in KATEGORI_GAGAL or h["kategori"] == "ngambek":
+            hasil_by_idx[i] = baru
+        if msg:
+            hasil_urut = [hasil_by_idx[k] for k in sorted(hasil_by_idx)]
+            teks = susun_pesan(hasil_urut, time.time() - mulai, False,
+                               progress=f"{idx_selesai}/{total}")
+            try:
+                await _edit_hasil(msg, teks)
+            except Exception:
+                pass
+        await asyncio.sleep(0.5)
 
 
 async def jalankan_cek(update: Update, context: ContextTypes.DEFAULT_TYPE, nomor_list: list):
