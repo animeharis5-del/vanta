@@ -46,6 +46,7 @@ STATS_PATH = BASE_DIR / config.STATS_FILE
 PREMIUM_PATH = BASE_DIR / config.PREMIUM_FILE
 BANNED_PATH = BASE_DIR / config.BANNED_FILE
 SPEED_PATH = BASE_DIR / getattr(config, "SPEED_FILE", "speed.json")
+FJ_PATH = BASE_DIR / getattr(config, "FORCE_JOIN_FILE", "force_join.json")
 
 _cooldown_tracker = {}
 
@@ -90,6 +91,39 @@ def load_speed() -> dict:
     return speed
 
 
+# ==================== FORCE JOIN (SETTINGAN OWNER) ====================
+
+def load_force_join() -> dict:
+    """Baca settingan force join; fallback ke config.py kalau file belum ada."""
+    default_links = [str(c).strip() for c in getattr(config, "FORCE_JOIN", []) or []
+                     if str(c).strip()]
+    data = _load_json(FJ_PATH, {
+        "enabled": bool(getattr(config, "FORCE_JOIN_ENABLED", True)),
+        "chats": default_links,
+    })
+    enabled = bool(data.get("enabled",
+                            getattr(config, "FORCE_JOIN_ENABLED", True)))
+    chats = data.get("chats")
+    if not isinstance(chats, list):
+        chats = default_links
+    chats = [str(c).strip() for c in chats if str(c).strip()]
+    return {"enabled": enabled, "chats": chats}
+
+
+def save_force_join(enabled: bool, chats: list):
+    _save_json(FJ_PATH, {
+        "enabled": bool(enabled),
+        "chats": [str(c).strip() for c in chats if str(c).strip()],
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+
+
+def force_join_aktif() -> list:
+    """Daftar chat force join bila fiturnya aktif; [] bila tidak."""
+    fj = load_force_join()
+    return fj["chats"] if fj["enabled"] else []
+
+
 def save_speed(speed: dict):
     _save_json(SPEED_PATH, {
         "bulk_delay": speed["bulk_delay"],
@@ -126,9 +160,46 @@ _EMOJI_MAP = getattr(config, "TG_EMOJI_MAP", {}) or {}
 _EMOJI_PATTERN = re.compile("|".join(re.escape(e) for e in sorted(_EMOJI_MAP, key=len, reverse=True))) if _EMOJI_MAP else None
 
 
+# Hanya ID yang terbukti valid dipakai (lihat catatan TG_EMOJI_MAP di config.py).
+# ID lain membuat Telegram menampilkan tag mentah <tg-emoji emoji-id="...">
+# seperti pada kasus ⚠️ — jadi disaring di sini.
+_TG_EMOJI_VALID_IDS = {
+    "5123163417326126159",   # ✅ Success
+    "5121063440311386962",   # ❌ Cancel
+    "5447644880824181073",   # ⚠️ Warning
+    "5875450995332353523",   # 🚫 Slash
+    "5116159438062879454",   # ⏳ Loading
+    "5350595795508814391",   # ⏱ Clock
+    "5127377673596700174",   # 🔄 Refresh
+    "5890925363067886150",   # ✨ Sparkle
+    "5350613306090482956",   # 📊 Graph
+    "5776233299424843260",   # 🌐 Globe
+    "5226513232549664618",   # 🔷 Option
+    "5350725709679584478",   # ⚙️ Gear
+    "6028530359975548369",   # 💎 Diamond
+    "5258337316715373336",   # 🛟 Call
+    "5260399854500191689",   # 👤 User
+    "5944970130554359187",   # 👥 People
+    "5258503720928288433",   # ℹ️ Info
+    "5258476306152038031",   # 🔒 Lock
+    "5260268501515377807",   # 📣 Broadcast
+    "5260512129240276089",   # 📚 Books
+}
+
+
 def _customize_emojis(text: str):
     if not isinstance(text, str) or not _EMOJI_PATTERN:
         return text, False
+
+    # Jaring pengaman: buang tag <tg-emoji> dengan ID tak dikenal yang sudah
+    # terlanjur ada di teks (misal dari rich_html) agar tak tampil mentah.
+    def buang_id_asing(match):
+        if match.group(1) in _TG_EMOJI_VALID_IDS:
+            return match.group(0)
+        return match.group(2)
+
+    text = re.sub(r'<tg-emoji\b[^>]*emoji-id="(\d+)"[^>]*>(.*?)</tg-emoji>',
+                  buang_id_asing, text, flags=re.S | re.I)
 
     # Jangan mengubah emoji di tag custom yang sudah ada atau di blok pre/code.
     protected = []
@@ -144,7 +215,7 @@ def _customize_emojis(text: str):
         nonlocal changed
         emoji = match.group(0)
         emoji_id = str(_EMOJI_MAP.get(emoji, "")).strip()
-        if emoji_id.isdigit():
+        if emoji_id in _TG_EMOJI_VALID_IDS:
             changed = True
             return f'<tg-emoji emoji-id="{emoji_id}">{emoji}</tg-emoji>'
         return emoji
@@ -721,7 +792,7 @@ async def job_backup(context: ContextTypes.DEFAULT_TYPE):
 
 async def cek_sudah_join(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> list:
     belum = []
-    for chat_id in config.FORCE_JOIN:
+    for chat_id in force_join_aktif():
         try:
             member = await context.bot.get_chat_member(chat_id, user_id)
             status = getattr(member, "status", None)
@@ -795,7 +866,7 @@ async def _edit_hasil(msg, rich_html):
 
 async def cek_force_join_atau_kirim(update: Update,
                                      context: ContextTypes.DEFAULT_TYPE) -> bool:
-    if not config.FORCE_JOIN:
+    if not force_join_aktif():
         return True
     user = update.effective_user
     if is_owner(user.id):
@@ -813,7 +884,9 @@ def tgemoji(key: str, fallback: str) -> str:
     """Ambil ID custom emoji dari pack berdasarkan karakter fallback."""
     emoji_map = getattr(config, "TG_EMOJI_MAP", {}) or {}
     emoji_id = str(emoji_map.get(fallback, "")).strip()
-    if emoji_id.isdigit():
+    # ID wajib ada di whitelist — kalau tidak, pakai emoji Unicode biasa
+    # supaya tidak muncul tag <tg-emoji ...> mentah di chat.
+    if emoji_id in _TG_EMOJI_VALID_IDS:
         return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
     return fallback
 
@@ -907,6 +980,13 @@ def teks_admin(user, s):
             ["<code>/bc pesan</code>", "broadcast informasi"],
             ["<code>/speed</code>", "atur kecepatan cek nomor"],
         ]) +
+        rich_ui.rich_para(
+            f"{tgemoji('lock', '\U0001f512')} <b>FORCE JOIN</b>") +
+        rich_ui.rich_info_table([
+            ["<code>/forcejoin</code>", "buka panel atur link & on/off"],
+            ["<code>/forcejoin on|off</code>", "aktif/nonaktifkan"],
+            ["<code>/forcejoin add|del</code>", "tambah/hapus link"],
+        ]) +
         rich_ui.rich_para(f"{tgemoji('stats', '📊')} <b>SYSTEM SNAPSHOT</b>") +
         rich_ui.rich_info_table([
             ["Premium", f"<b>{len(prem)}</b>"],
@@ -941,8 +1021,10 @@ def spec_nav(user_id: int):
 
 
 def spec_admin():
-    return [[{"text": "🏠  DASHBOARD", "callback_data": "menu_awal",
-               "style": "primary"}]]
+    return [[{"text": "🔒  FORCE JOIN", "callback_data": "fj_panel",
+              "style": "primary"}],
+            [{"text": "🏠  DASHBOARD", "callback_data": "menu_awal",
+              "style": "primary"}]]
 
 
 def spec_force_join(belum_join: list):
@@ -1025,7 +1107,7 @@ async def tombol_detek(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await aman_answer(query)
 
     user = update.effective_user
-    if config.FORCE_JOIN and not is_owner(user.id):
+    if force_join_aktif() and not is_owner(user.id):
         belum = await cek_sudah_join(context, user.id)
         if belum:
             await aman_answer(query, "🔒 Join dulu ya!", show_alert=True)
@@ -1042,6 +1124,11 @@ async def tombol_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await aman_answer(query)
     user = update.effective_user
     s = get_stats(user.id)
+    if query.data == "fj_panel":
+        await kirim_atau_edit(query, teks_forcejoin_panel(),
+                              _kb_ptb(spec_forcejoin_panel()),
+                              spec_forcejoin_panel())
+        return
     await kirim_atau_edit(query, teks_admin(user, s), buat_keyboard_admin(),
                           spec_admin())
 
@@ -1052,7 +1139,7 @@ async def tombol_menu_awal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await aman_answer(query)
 
     user = update.effective_user
-    if config.FORCE_JOIN and not is_owner(user.id):
+    if force_join_aktif() and not is_owner(user.id):
         belum = await cek_sudah_join(context, user.id)
         if belum:
             await aman_answer(query, "🔒 Join dulu ya!", show_alert=True)
@@ -1061,6 +1148,19 @@ async def tombol_menu_awal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     s = get_stats(user.id)
     await kirim_atau_edit(query, teks_menu_awal(user, s),
                           buat_keyboard_menu(user.id), spec_menu(user.id))
+
+
+def _fj_norm(chat: str) -> str:
+    """Normalisasi input owner jadi ID/username yang bisa dipakai Bot API."""
+    c = str(chat).strip()
+    if not c:
+        return ""
+    # https://t.me/xxx atau t.me/xxx -> @xxx (channel/grup publik)
+    m = re.match(r"^(?:https?://)?(?:www\.)?t\.me/(?!\+)([A-Za-z0-9_]{4,})/?$", c)
+    if m:
+        return "@" + m.group(1)
+    # Undangan pribadi tidak bisa diverifikasi bot -> simpan apa adanya
+    return c
 
 
 async def tombol_cek_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1073,7 +1173,7 @@ async def tombol_cek_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await aman_answer(query, "🚫 Anda dibanned.", show_alert=True)
         return
 
-    if not config.FORCE_JOIN or is_owner(user.id):
+    if not force_join_aktif() or is_owner(user.id):
         await aman_answer(query, "✅ Udah join.", show_alert=True)
         return
 
@@ -1583,6 +1683,171 @@ async def tombol_speed(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 preset["bulk_delay"], preset["max_paralel"])
 
 
+# ==================== FORCE JOIN PANEL (OWNER) ====================
+
+def spec_forcejoin_panel() -> list:
+    fj = load_force_join()
+    rows = [[{"text": "🟢 AKTIFKAN" if not fj["enabled"] else "🔴 MATIKAN",
+              "callback_data": "fj_toggle",
+              "style": "success" if not fj["enabled"] else "danger"}]]
+    rows.append([{"text": "➕ TAMBAH LINK", "callback_data": "fj_add",
+                  "style": "primary"}])
+    for c in fj["chats"]:
+        rows.append([{"text": f"🗑 HAPUS {c}", "callback_data": f"fj_del::{c}",
+                      "style": "danger"}])
+    rows.append([{"text": "🏠  DASHBOARD", "callback_data": "menu_awal",
+                  "style": "primary"}])
+    return rows
+
+
+def teks_forcejoin_panel() -> str:
+    fj = load_force_join()
+    status = (f"{tgemoji('success', '✅')} <b>AKTIF</b>" if fj["enabled"]
+              else f"{tgemoji('failed', '❌')} <b>MATI</b>")
+    daftar = "".join(f"<code>{html.escape(c)}</code>\n"
+                     for c in fj["chats"]) or "<i>Belum ada link.</i>"
+    return (
+        rich_ui.rich_h2(f"{tgemoji('lock', '🔒')} {BOT_DISPLAY} • FORCE JOIN") +
+        rich_ui.rich_para(f"Status: {status}") +
+        rich_ui.rich_para("<b>Daftar channel/grup:</b>") +
+        rich_ui.rich_para(daftar.strip()) +
+        rich_ui.rich_fold(
+            f"{tgemoji('help', '📚')} CARA PAKAI",
+            rich_ui.rich_checklist([
+                "<code>/forcejoin on</code> — aktifkan force join",
+                "<code>/forcejoin off</code> — nonaktifkan force join",
+                "<code>/forcejoin add @channelku</code> — tambah link",
+                "<code>/forcejoin del @channelku</code> — hapus link",
+                "Link boleh username (@abc), ID (-100...), atau t.me/abc.",
+                "Bot harus jadi ADMIN di channel/grup agar bisa cek member.",
+            ]))
+    )
+
+
+async def _fj_tampilkan(update, context):
+    await balas_rich(update, context, teks_forcejoin_panel(),
+                     _kb_ptb(spec_forcejoin_panel()), spec_forcejoin_panel())
+
+
+@owner_only
+@banned_guard
+async def forcejoin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    fj = load_force_join()
+    aksi = args[0].lower() if args else ""
+
+    if not aksi:
+        await _fj_tampilkan(update, context)
+        return
+
+    if aksi == "on":
+        if not fj["chats"]:
+            await balas(update, context,
+                        "❌ Belum ada link. Tambah dulu:\n"
+                        "<code>/forcejoin add @channelku</code>",
+                        parse_mode="HTML")
+            return
+        save_force_join(True, fj["chats"])
+        await balas(update, context,
+                    f"✅ Force join DIAKTIFKAN untuk {len(fj['chats'])} link.")
+    elif aksi == "off":
+        save_force_join(False, fj["chats"])
+        await balas(update, context, "❌ Force join DINONAKTIFKAN.")
+    elif aksi in ("add", "+"):
+        if len(args) < 2:
+            await balas(update, context,
+                        "❌ Format: <code>/forcejoin add @channelku</code>",
+                        parse_mode="HTML")
+            return
+        baru = _fj_norm(" ".join(args[1:]))
+        if not baru:
+            await balas(update, context, "❌ Link tidak valid.")
+            return
+        if any(str(c).lower() == baru.lower() for c in fj["chats"]):
+            await balas(update, context, f"⚠️ <code>{html.escape(baru)}</code> sudah ada.",
+                        parse_mode="HTML")
+            return
+        chats = fj["chats"] + [baru]
+        save_force_join(fj["enabled"], chats)
+        await balas(update, context,
+                    f"➕ Ditambahkan: <code>{html.escape(baru)}</code>\n"
+                    f"Total {len(chats)} link. "
+                    "Pastikan bot jadi ADMIN di channel/grup itu biar bisa cek member.",
+                    parse_mode="HTML")
+    elif aksi in ("del", "hapus", "-"):
+        if len(args) < 2:
+            await balas(update, context,
+                        "❌ Format: <code>/forcejoin del @channelku</code>",
+                        parse_mode="HTML")
+            return
+        target = _fj_norm(" ".join(args[1:])).lower()
+        chats = [c for c in fj["chats"] if str(c).lower() != target]
+        if len(chats) == len(fj["chats"]):
+            await balas(update, context, "❌ Link tidak ditemukan di daftar.")
+            return
+        save_force_join(fj["enabled"], chats)
+        await balas(update, context,
+                    f"🗑 Dihapus. Sisa {len(chats)} link.")
+    else:
+        await balas(update, context,
+                    "❌ Aksi tidak dikenal. Pakai:\n"
+                    "<code>/forcejoin on|off</code>\n"
+                    "<code>/forcejoin add @channel</code>\n"
+                    "<code>/forcejoin del @channel</code>",
+                    parse_mode="HTML")
+        return
+
+    if aksi:
+        await _fj_tampilkan(update, context)
+
+
+@owner_only
+@banned_guard
+async def tombol_forcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    data = query.data or ""
+    fj = load_force_join()
+
+    if data == "fj_toggle":
+        if not fj["enabled"] and not fj["chats"]:
+            await aman_answer(query, "Tambahkan link dulu via /forcejoin add",
+                              show_alert=True)
+            return
+        baru = not fj["enabled"]
+        save_force_join(baru, fj["chats"])
+        await aman_answer(query, "🟢 Force join AKTIF!" if baru
+                          else "🔴 Force join MATI!")
+        await kirim_atau_edit(query, teks_forcejoin_panel(),
+                              _kb_ptb(spec_forcejoin_panel()),
+                              spec_forcejoin_panel())
+        logger.info("🔐 Owner %s %s force join.", user.id,
+                    "mengaktifkan" if baru else "menonaktifkan")
+        return
+
+    if data == "fj_add":
+        await aman_answer(
+            query,
+            "Kirim pesan biasa:\n/forcejoin add @channel\n"
+            "contoh: /forcejoin add t.me/channelku", show_alert=True)
+        return
+
+    if data.startswith("fj_del::"):
+        target = data[len("fj_del::"):].strip().lower()
+        chats = [c for c in fj["chats"] if str(c).lower() != target]
+        if len(chats) == len(fj["chats"]):
+            await aman_answer(query, "Sudah terhapus.", show_alert=True)
+            return
+        save_force_join(fj["enabled"], chats)
+        await aman_answer(query, "🗑 Link dihapus.")
+        await kirim_atau_edit(query, teks_forcejoin_panel(),
+                              _kb_ptb(spec_forcejoin_panel()),
+                              spec_forcejoin_panel())
+        return
+
+    await aman_answer(query)
+
+
 # ==================== ERROR HANDLER ====================
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1628,6 +1893,7 @@ async def _post_init(app):
                     BotCommand("unban", "Unban user"),
                     BotCommand("bc", "Broadcast pesan"),
                     BotCommand("speed", "Atur kecepatan cek nomor"),
+                    BotCommand("forcejoin", "Atur link & on/off force join"),
                 ],
                 scope=BotCommandScopeChat(chat_id=int(config.OWNER_ID)),
             )
@@ -1654,6 +1920,7 @@ def main():
     app.add_handler(CommandHandler("unban", unban_cmd))
     app.add_handler(CommandHandler("bc", bc_cmd))
     app.add_handler(CommandHandler("speed", speed_cmd))
+    app.add_handler(CommandHandler("forcejoin", forcejoin_cmd))
 
     # Tombol inline
     app.add_handler(CallbackQueryHandler(tombol_detek, pattern="^detek$"))
@@ -1662,6 +1929,9 @@ def main():
     app.add_handler(CallbackQueryHandler(tombol_cek_join, pattern="^cek_join$"))
     app.add_handler(CallbackQueryHandler(tombol_speed,
                                          pattern=r"^speed_(set_|kustom)"))
+    app.add_handler(CallbackQueryHandler(tombol_forcejoin,
+                                         pattern=r"^fj_(toggle|add|del::)"))
+    app.add_handler(CallbackQueryHandler(tombol_admin, pattern="^fj_panel$"))
 
     # Error handler
     app.add_error_handler(error_handler)
