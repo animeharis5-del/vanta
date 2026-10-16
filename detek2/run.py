@@ -1120,7 +1120,7 @@ def teks_admin(user, s):
             ["<code>/speed</code>", "atur kecepatan cek nomor"],
         ]) +
         rich_ui.rich_para(
-            f"{tgemoji('lock', '\U0001f512')} <b>FORCE JOIN</b>") +
+            f"{tgemoji('lock', '🔒')} <b>FORCE JOIN</b>") +
         rich_ui.rich_info_table([
             ["<code>/forcejoin</code>", "buka panel atur link & on/off"],
             ["<code>/forcejoin on|off</code>", "aktif/nonaktifkan"],
