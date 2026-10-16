@@ -48,8 +48,46 @@ PREMIUM_PATH = BASE_DIR / config.PREMIUM_FILE
 BANNED_PATH = BASE_DIR / config.BANNED_FILE
 SPEED_PATH = BASE_DIR / getattr(config, "SPEED_FILE", "speed.json")
 FJ_PATH = BASE_DIR / getattr(config, "FORCE_JOIN_FILE", "force_join.json")
+LOG_PATH = BASE_DIR / "log_detek.jsonl"
+SESI_PATH = BASE_DIR / "sesi_gagal.json"
 
 _cooldown_tracker = {}
+
+# Sesi deteksi terakhir per user (in-memory) — dipakai tombol 🔄 ULANGI GAGAL.
+_sesi_simpanan = {}
+
+
+def _simpan_sesi(user_id: int, hasil_list: list, methods: list) -> str:
+    """Simpan hasil sesi detek terakhir; ID pendek untuk callback tombol ulang."""
+    sid = f"{int(time.time()) % 1_000_000:x}{random.randint(16, 255):x}"
+    _sesi_simpanan[str(user_id)] = {
+        "hasil": hasil_list,
+        "methods": list(methods or []) or METODE_TERSUMBUH,
+        "ts": time.time(),
+    }
+    return sid
+
+
+def _ambil_sesi(user_id, sesi_id: str):
+    s = _sesi_simpanan.get(str(user_id))
+    if not s or not s.get("hasil"):
+        return None
+    # Sesi dianggap kedaluwarsa setelah 1 jam.
+    if time.time() - s.get("ts", 0) > 3600:
+        return None
+    if sesi_id and s.get("sid") and s["sid"] != sesi_id:
+        pass  # sesi lama masih dilayani selama belum kedaluwarsa
+    return s
+
+
+def spec_ulang(gagal_noms: list, sesi_id: str) -> list:
+    rows = [[{"text": f"🔄  ULANGI GAGAL ({len(gagal_noms)})",
+              "callback_data": f"ulang::{sesi_id}", "style": "primary"}]]
+    return rows
+
+
+def teks_hasil_dilewati_ui(hasil_list) -> str:
+    return susun_pesan(list(hasil_list), 0.0, True)
 
 
 # ==================== DATABASE / BACA-TULIS JSON ====================
@@ -116,6 +154,11 @@ def load_settings() -> dict:
         s["tombol_ulang"] = bool(s["tombol_ulang"])
     except Exception:
         s["tombol_ulang"] = True
+    # Terapkan mode koneksi sesuai setelan owner (langsung/proxy).
+    try:
+        _set_mode_proxy(s["mode_proxy"] == "langsung")
+    except Exception as e:
+        logger.warning("Gagal terapkan mode proxy: %s", e)
     return s
 
 
@@ -124,6 +167,66 @@ def save_settings(patch: dict) -> dict:
     s.update(patch or {})
     _save_json(SETTINGS_PATH, s)
     return s
+
+
+def _set_mode_proxy(langsung: bool):
+    """Pasang mode koneksi ke API WhatsApp sesuai setelan owner.
+
+    "langsung" -> matikan semua env proxy (cek IP server apa adanya).
+    "proxy"    -> aktifkan WA_USE_PROXY supaya pakai pool proxy gratis;
+                  jauh lebih andal untuk nomor luar negeri (Nepal/Sri Lanka
+                  sering diblokir dari IP datacenter).
+    """
+    if langsung:
+        for var in ("WA_USE_PROXY", "WA_PROXY", "WA_ampas"):
+            os.environ.pop(var, None)
+    else:
+        if not any(os.environ.get(v) for v in ("WA_USE_PROXY", "WA_PROXY", "WA_ampas")):
+            os.environ["WA_USE_PROXY"] = "1"
+
+
+# ==================== LOG DETEKSI (per user) ====================
+
+def catat_log(user_id, username, tier, jumlah, kategori_count: dict, durasi):
+    """Append satu baris log ke log_detek.jsonl (dipakai /log & /statistik)."""
+    try:
+        row = {
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "uid": str(user_id),
+            "uname": username,
+            "tier": tier,
+            "jumlah": jumlah,
+            "hasil": kategori_count,
+            "durasi": round(float(durasi), 2),
+        }
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        # Batasi ukuran log ~5000 baris terakhir.
+        try:
+            lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
+            if len(lines) > 5000:
+                LOG_PATH.write_text("\n".join(lines[-5000:]) + "\n",
+                                    encoding="utf-8")
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("Gagal nulis log detek: %s", e)
+
+
+def baca_log(terakhir: int = 10) -> list:
+    if not LOG_PATH.exists():
+        return []
+    try:
+        lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    out = []
+    for baris in lines[-terakhir:]:
+        try:
+            out.append(json.loads(baris))
+        except Exception:
+            continue
+    return out
 
 
 # ==================== KECEPATAN CEK (SETTINGAN OWNER) ====================
@@ -205,21 +308,6 @@ def sinkronkan_semaphore():
     terpakai = _sem_capacity - _detect_semaphore._value
     _detect_semaphore._value = max(0, target - terpakai)
     _sem_capacity = target
-
-
-def _set_mode_proxy(langsung: bool):
-    """Pasang mode koneksi ke API WhatsApp sesuai setelan owner.
-
-    "langsung" -> matikan semua env proxy (cek IP server apa adanya).
-    "proxy"    -> aktifkan WA_USE_PROXY supaya pakai pool proxy gratis;
-                  kalau env belum ada di container, set otomatis di sini.
-    """
-    if langsung:
-        for var in ("WA_USE_PROXY", "WA_PROXY", "WA_ampas"):
-            os.environ.pop(var, None)
-    else:
-        if not any(os.environ.get(v) for v in ("WA_USE_PROXY", "WA_PROXY", "WA_ampas")):
-            os.environ["WA_USE_PROXY"] = "1"
 
 
 # ==================== HELPER KIRIM PESAN ====================
@@ -478,13 +566,34 @@ def is_banned(user_id: int) -> dict | None:
     return data.get("users", {}).get(str(user_id))
 
 
+# Daftar owner tambahan (bisa diatur via /owner add|del, disimpan di
+# bot_settings.json key "owner_tambahan").
+def daftar_owner() -> list:
+    try:
+        utama = int(config.OWNER_ID)
+    except (TypeError, ValueError):
+        utama = None
+    tambahan = []
+    for x in load_settings().get("owner_tambahan", []) or []:
+        try:
+            tambahan.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    out = []
+    for oid in [utama] + tambahan:
+        if oid is not None and oid not in out:
+            out.append(oid)
+    return out
+
+
 def is_owner(user_id: int) -> bool:
-    if config.OWNER_ID is None:
+    if config.OWNER_ID is None and not daftar_owner():
         return False
     try:
-        return user_id == int(config.OWNER_ID)
+        uid = int(user_id)
     except (TypeError, ValueError):
         return False
+    return uid in daftar_owner()
 
 
 # ==================== USER TIER ====================
@@ -571,12 +680,8 @@ def valid_nomor(teks: str) -> bool:
 
 def owner_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if config.OWNER_ID is not None:
-            try:
-                oid = int(config.OWNER_ID)
-            except (TypeError, ValueError):
-                oid = config.OWNER_ID
-            if update.effective_user.id != oid:
+        if config.OWNER_ID is not None or daftar_owner():
+            if not is_owner(update.effective_user.id):
                 if update.callback_query:
                     await aman_answer(update.callback_query, "⛔ Khusus owner!", show_alert=True)
                 else:
@@ -1160,8 +1265,16 @@ def spec_nav(user_id: int):
 
 
 def spec_admin():
-    return [[{"text": "🔒  FORCE JOIN", "callback_data": "fj_panel",
+    return [[{"text": "⚡  KECEPATAN CEK", "callback_data": "speed_panel",
               "style": "primary"}],
+            [{"text": "⚙️  SETELAN BOT", "callback_data": "set_panel",
+              "style": "primary"}],
+            [{"text": "🔒  FORCE JOIN", "callback_data": "fj_panel",
+              "style": "primary"}],
+            [{"text": "🏓  STATUS / PING", "callback_data": "status_panel",
+              "style": "primary"}],
+            [{"text": "🧹  BERSIHKAN DATA", "callback_data": "bersih_panel",
+              "style": "danger"}],
             [{"text": "🏠  DASHBOARD", "callback_data": "menu_awal",
               "style": "primary"}]]
 
@@ -1511,7 +1624,78 @@ async def _proses_cek(update, context, nomor_list, user, setting,
         uname = user.username or user.first_name or str(user.id)
         update_stats(user.id, uname, len(hasil_list))
 
+        # Simpan log ringkas untuk /log & /statistik owner.
+        try:
+            kategori_count = {}
+            for h in hasil_list:
+                k = h.get("kategori") or "error"
+                kategori_count[k] = kategori_count.get(k, 0) + 1
+            catat_log(user.id, uname, tier, len(hasil_list),
+                      kategori_count, durasi)
+        except Exception:
+            pass
+
         logger.info(f"🔍 Deteksi oleh {user.id} ({uname}) - {len(hasil_list)} nomor ({tier})")
+
+
+async def _ulangi_semua_gagal(update, context, user, sesi):
+    """Handler tombol 🔄 ULANGI GAGAL — ulangi SEMUA nomor gagal sesi terakhir."""
+    query = update.callback_query
+    hasil_list = [h for h in sesi["hasil"]
+                  if h.get("kategori") in KATEGORI_GAGAL]
+    if not hasil_list:
+        await aman_answer(query, "Gak ada nomor gagal yang perlu diulangi.",
+                          show_alert=True)
+        return
+
+    nomor_saja = [h["nomor"] for h in hasil_list]
+    await aman_answer(query, f"🔄 Mengulangi {len(nomor_saja)} nomor gagal...")
+
+    msg = await context.bot.send_message(
+        chat_id=user.id,
+        text=f"🔄 Ulangi {len(nomor_saja)} nomor gagal...")
+
+    mulai = time.time()
+    hasil_baru = []
+    for i, h in enumerate(hasil_list, 1):
+        try:
+            baru = await cek_satu_nomor_ringkas(h["nomor"], sesi["methods"])
+        except Exception as e:
+            baru = dict(h)
+            baru["alasan"] = _ringkas_alasan(e)
+        hasil_baru.append(baru)
+        try:
+            await _edit_hasil(
+                msg, susun_pesan(hasil_baru, time.time() - mulai, False,
+                                 progress=f"{i}/{len(hasil_list)}"))
+        except Exception:
+            pass
+        await asyncio.sleep(0.5)
+
+    durasi = time.time() - mulai
+    teks = susun_pesan(hasil_baru, durasi, True)
+    masih_gagal = [b["nomor"] for b in hasil_baru
+                   if b.get("kategori") in KATEGORI_GAGAL]
+    kb = None
+    if masih_gagal and load_settings()["tombol_ulang"]:
+        sid = _simpan_sesi(user.id, hasil_baru, sesi["methods"])
+        kb = _kb_ptb(spec_ulang(masih_gagal, sid))
+    try:
+        await _edit_hasil(msg, teks, keyboard=kb)
+    except Exception:
+        pass
+
+    uname = user.username or user.first_name or str(user.id)
+    update_stats(user.id, uname, len(hasil_baru))
+    try:
+        kategori_count = {}
+        for b in hasil_baru:
+            k = b.get("kategori") or "error"
+            kategori_count[k] = kategori_count.get(k, 0) + 1
+        catat_log(user.id, uname, cek_tier(user.id), len(hasil_baru),
+                  kategori_count, durasi)
+    except Exception:
+        pass
 
 
 async def _ulangi_nomor_gagal(hasil_by_idx, methods, user_id, msg,
@@ -1540,13 +1724,14 @@ async def _ulangi_nomor_gagal(hasil_by_idx, methods, user_id, msg,
         await asyncio.sleep(0.5)
 
 
-async def jalankan_cek(update: Update, context: ContextTypes.DEFAULT_TYPE, nomor_list: list):
+async def jalankan_cek(update: Update, context: ContextTypes.DEFAULT_TYPE, nomor_list: list,
+                        lewati_cooldown: bool = False):
     user = update.effective_user
     setting = ambil_setting(user.id)
     tier = setting["tier"]
 
     sisa = sisa_cooldown(user.id)
-    if sisa > 0:
+    if sisa > 0 and not (lewati_cooldown and is_owner(user.id)):
         await balas(update, context,
                     f"⏳ Sabar dikit ya.\n"
                     f"Cooldown kamu masih {detik_ke_teks(sisa)} lagi.\n\n"
@@ -2028,6 +2213,437 @@ async def tombol_forcejoin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await aman_answer(query)
+
+
+# ==================== SETELAN BOT PANEL (OWNER) ====================
+
+def spec_setelan() -> list:
+    s = load_settings()
+    rows = [
+        [{"text": ("🔄 AUTO-RETRY: AKTIF" if s["retry_gagal"]
+                    else "🔄 AUTO-RETRY: MATI"),
+          "callback_data": "set_retry",
+          "style": "success" if s["retry_gagal"] else "danger"}],
+        [{"text": f"🔁 MAKS RETRY: {s['retry_maksimal']}",
+          "callback_data": "set_retry_n", "style": "primary"}],
+        [{"text": ("🌐 MODE: PROXY" if s["mode_proxy"] == "proxy"
+                    else "🌍 MODE: LANGSUNG"),
+          "callback_data": "set_mode",
+          "style": "success" if s["mode_proxy"] == "proxy" else "primary"}],
+        [{"text": ("🔘 TOMBOL ULANG: AKTIF" if s["tombol_ulang"]
+                    else "🔘 TOMBOL ULANG: MATI"),
+          "callback_data": "set_tombol",
+          "style": "success" if s["tombol_ulang"] else "danger"}],
+        [{"text": "🏠  DASHBOARD", "callback_data": "menu_awal",
+          "style": "primary"}],
+    ]
+    return rows
+
+
+def teks_setelan() -> str:
+    s = load_settings()
+    ya = lambda v: f"{tgemoji('success', '✅')} AKTIF" if v \
+        else f"{tgemoji('failed', '❌')} MATI"
+    return (
+        rich_ui.rich_h2(f"{tgemoji('speed', '⚙️')} {BOT_DISPLAY} • SETELAN BOT") +
+        rich_ui.rich_para("<i>Ubah lewat tombol, langsung berlaku tanpa restart.</i>") +
+        rich_ui.rich_info_table([
+            ["Auto-retry nomor gagal", ya(s["retry_gagal"])],
+            ["Maksimal retry", f"<b>{s['retry_maksimal']}x</b>"],
+            ["Mode koneksi", f"<b>{s['mode_proxy'].upper()}</b>"],
+            ["Tombol 🔄 ULANGI GAGAL", ya(s["tombol_ulang"])],
+        ]) +
+        rich_ui.rich_fold(
+            f"{tgemoji('help', '📚')} CATATAN",
+            rich_ui.rich_checklist([
+                "<b>Mode LANGSUNG</b> — cepat, tapi IP datacenter sering "
+                "diblokir server WA untuk nomor luar negeri (Nepal +977, "
+                "Sri Lanka +94, dll).",
+                "<b>Mode PROXY</b> — pakai pool proxy gratis, lebih andal "
+                "untuk nomor luar negeri tapi sedikit lebih lambat.",
+                "Kalau banyak nomor error/timeout, coba ganti ke mode PROXY.",
+            ]))
+    )
+
+
+@owner_only
+@banned_guard
+async def tombol_setelan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+    data = query.data or ""
+    s = load_settings()
+
+    if data == "set_retry":
+        s["retry_gagal"] = not s["retry_gagal"]
+        save_settings({"retry_gagal": s["retry_gagal"]})
+        await aman_answer(query, "🔄 Auto-retry AKTIF!" if s["retry_gagal"]
+                          else "🔄 Auto-retry MATI!")
+    elif data == "set_retry_n":
+        baru = (int(s["retry_maksimal"]) + 1) % 6  # 0..5 lalu muter
+        save_settings({"retry_maksimal": baru})
+        s["retry_maksimal"] = baru
+        await aman_answer(query, f"🔁 Maksimal retry: {baru}x")
+    elif data == "set_mode":
+        s["mode_proxy"] = "langsung" if s["mode_proxy"] == "proxy" else "proxy"
+        save_settings({"mode_proxy": s["mode_proxy"]})
+        _set_mode_proxy(s["mode_proxy"] == "langsung")
+        await aman_answer(query,
+                          "🌐 Mode PROXY aktif!" if s["mode_proxy"] == "proxy"
+                          else "🌍 Mode LANGSUNG aktif!")
+        logger.info("🌐 Owner %s ganti mode koneksi: %s",
+                    user.id, s["mode_proxy"])
+    elif data == "set_tombol":
+        s["tombol_ulang"] = not s["tombol_ulang"]
+        save_settings({"tombol_ulang": s["tombol_ulang"]})
+        await aman_answer(query, "🔘 Tombol ulang AKTIF!" if s["tombol_ulang"]
+                          else "🔘 Tombol ulang MATI!")
+    else:
+        await aman_answer(query)
+        return
+
+    await kirim_atau_edit(query, teks_setelan(),
+                          _kb_ptb(spec_setelan()), spec_setelan())
+
+
+# ==================== OWNER TAMBAHAN (/owner) ====================
+
+@owner_only
+@banned_guard
+async def owner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    aksi = args[0].lower() if args else ""
+    settings = load_settings()
+    tambahan = [int(x) for x in settings.get("owner_tambahan", []) or []
+                if str(x).lstrip("-").isdigit()]
+
+    if not aksi or aksi == "list":
+        daftar = "\n".join(f"<code>{o}</code>" for o in daftar_owner()) or "-"
+        await balas(update, context,
+                    f"👑 <b>DAFTAR OWNER</b>\n{daftar}\n\n"
+                    "Pakai:\n<code>/owner add ID</code> — angkat admin lain "
+                    "jadi owner\n<code>/owner del ID</code> — turunkan owner "
+                    "tambahan", parse_mode="HTML")
+        return
+
+    if aksi in ("add", "+"):
+        if len(args) < 2:
+            await balas(update, context,
+                        "❌ Format: <code>/owner add 123456789</code>",
+                        parse_mode="HTML")
+            return
+        try:
+            target = int(args[1])
+        except ValueError:
+            await balas(update, context, "❌ ID harus angka.")
+            return
+        if target in daftar_owner():
+            await balas(update, context, "⚠️ Dia sudah owner.")
+            return
+        tambahan.append(target)
+        save_settings({"owner_tambahan": tambahan})
+        await balas(update, context,
+                    f"👑 <code>{target}</code> sekarang jadi owner. "
+                    "Dia bisa buka menu OWNER COMMAND setelah /start lagi.",
+                    parse_mode="HTML")
+    elif aksi in ("del", "hapus", "-"):
+        if len(args) < 2:
+            await balas(update, context,
+                        "❌ Format: <code>/owner del 123456789</code>",
+                        parse_mode="HTML")
+            return
+        try:
+            target = int(args[1])
+        except ValueError:
+            await balas(update, context, "❌ ID harus angka.")
+            return
+        if target == int(config.OWNER_ID or 0):
+            await balas(update, context,
+                        "❌ Owner utama gak bisa dihapus dari config.")
+            return
+        if target not in tambahan:
+            await balas(update, context, "❌ Dia bukan owner tambahan.")
+            return
+        tambahan.remove(target)
+        save_settings({"owner_tambahan": tambahan})
+        await balas(update, context, f"✅ <code>{target}</code> bukan owner lagi.",
+                    parse_mode="HTML")
+    else:
+        await balas(update, context,
+                    "❌ Aksi tidak dikenal. Pakai:\n"
+                    "<code>/owner list</code>\n<code>/owner add ID</code>\n"
+                    "<code>/owner del ID</code>", parse_mode="HTML")
+
+
+# ==================== BAN LIST & CEK USER ====================
+
+@owner_only
+@banned_guard
+async def banlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = load_banned().get("users", {})
+    if not data:
+        await balas(update, context, "✅ Belum ada user yang dibanned.")
+        return
+    baris = []
+    for uid, info in list(data.items())[:50]:
+        baris.append([f"<code>{uid}</code>",
+                      html.escape(str(info.get("reason") or "-")),
+                      str(info.get("since", "-"))])
+    teks = (
+        rich_ui.rich_h2(f"{tgemoji('noentry', '🚫')} DAFTAR BANNED "
+                        f"({len(data)})") +
+        rich_ui.rich_data_table(["ID", "Alasan", "Sejak"], baris) +
+        rich_ui.rich_para("Unban: <code>/unban ID</code>")
+    )
+    await balas_rich(update, context, teks)
+
+
+@owner_only
+@banned_guard
+async def cekuser_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if not args:
+        await balas(update, context,
+                    "Usage: <code>/cekuser ID</code>", parse_mode="HTML")
+        return
+    try:
+        target = int(args[0])
+    except ValueError:
+        await balas(update, context, "❌ ID harus angka.")
+        return
+
+    st = get_stats(target)
+    tier = cek_tier(target)
+    ban = is_banned(target)
+    owner = is_owner(target)
+    status = "👑 OWNER" if owner else ("💎 PREMIUM" if tier == "premium" else "🔹 BIASA")
+    baris = [
+        ["Telegram ID", f"<code>{target}</code>"],
+        ["Username", html.escape(str(st.get("username") or "-"))],
+        ["Status", status],
+        ["Total detek", f"<b>{st['total']}</b>"],
+        ["Detek hari ini", f"<b>{st['today']}</b>"],
+    ]
+    if ban:
+        baris.append(["Ban", html.escape(
+            f"🚫 {ban.get('reason') or '-'} (sejak {ban.get('since', '-')})")])
+    teks = (
+        rich_ui.rich_h2(f"{tgemoji('profile', '👤')} {BOT_DISPLAY} • CEK USER") +
+        rich_ui.rich_info_table(baris)
+    )
+    await balas_rich(update, context, teks)
+
+
+# ==================== LOG & STATISTIK ====================
+
+@owner_only
+@banned_guard
+async def log_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    n = 10
+    if args:
+        try:
+            n = min(50, max(1, int(args[0])))
+        except ValueError:
+            pass
+    rows = baca_log(n)
+    if not rows:
+        await balas(update, context, "📭 Belum ada log deteksi.")
+        return
+    baris = []
+    for r in reversed(rows):
+        h = r.get("hasil", {})
+        ringkas = (f"✅{h.get('siap', 0)} ⏱{h.get('cooldown', 0)} "
+                   f"❌{h.get('banned', 0)} ⚠️{h.get('error', 0) + h.get('ngambek', 0)}")
+        baris.append([str(r.get("ts", "-")),
+                      html.escape(str(r.get("uname") or r.get("uid") or "-"))[:20],
+                      f"<b>{r.get('jumlah', 0)}</b>", ringkas])
+    teks = (
+        rich_ui.rich_h2(f"{tgemoji('detek', '📋')} LOG DETEKSI TERAKHIR") +
+        rich_ui.rich_data_table(["Waktu", "User", "Jml", "Hasil"], baris) +
+        rich_ui.rich_para(f"Menampilkan {len(baris)} entri terakhir. "
+                          "Format: <code>/log 20</code>")
+    )
+    await balas_rich(update, context, teks)
+
+
+@owner_only
+@banned_guard
+async def statistik_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = baca_log(5000)
+    total_sesi = len(rows)
+    total_nomor = sum(int(r.get("jumlah", 0)) for r in rows)
+    kategori = {}
+    per_user = {}
+    hari_ini = datetime.now().strftime("%Y-%m-%d")
+    nomor_hari_ini = 0
+    for r in rows:
+        for k, v in (r.get("hasil") or {}).items():
+            kategori[k] = kategori.get(k, 0) + int(v)
+        uid = r.get("uid")
+        per_user[uid] = per_user.get(uid, 0) + int(r.get("jumlah", 0))
+        if str(r.get("ts", "")).startswith(hari_ini):
+            nomor_hari_ini += int(r.get("jumlah", 0))
+    top = sorted(per_user.items(), key=lambda x: -x[1])[:5]
+    stats = load_stats()
+    teks = (
+        rich_ui.rich_h2(f"{tgemoji('stats', '📊')} {BOT_DISPLAY} • STATISTIK") +
+        rich_ui.rich_info_table([
+            ["Total user terdaftar", f"<b>{stats['global'].get('total_users', 0)}</b>"],
+            ["Total sesi detek", f"<b>{total_sesi}</b>"],
+            ["Total nomor dicek", f"<b>{total_nomor}</b>"],
+            ["Nomor dicek hari ini", f"<b>{nomor_hari_ini}</b>"],
+            ["Premium aktif", f"<b>{len(load_premium().get('users', {}))}</b>"],
+            ["User banned", f"<b>{len(load_banned().get('users', {}))}</b>"],
+        ]) +
+        rich_ui.rich_para(f"{tgemoji('detek', '🧮')} <b>REKAP KATEGORI</b>") +
+        rich_ui.rich_data_table(
+            ["Kategori", "Jumlah"],
+            [[k, f"<b>{v}</b>"] for k, v in sorted(kategori.items(),
+                                                   key=lambda x: -x[1])]) +
+        rich_ui.rich_para(f"{tgemoji('users', '🏆')} <b>TOP 5 USER</b>") +
+        rich_ui.rich_data_table(
+            ["ID", "Nomor"],
+            [[f"<code>{u}</code>", f"<b>{j}</b>"] for u, j in top] or
+            [["-", "-"]])
+    )
+    await balas_rich(update, context, teks)
+
+
+# ==================== PING / STATUS BOT ====================
+
+_start_time = time.time()
+
+
+@owner_only
+@banned_guard
+async def ping_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uptime = int(time.time() - _start_time)
+    jam, sisa = divmod(uptime, 3600)
+    menit, detik = divmod(sisa, 60)
+    speed = load_speed()
+    s = load_settings()
+    versi_api = "unknown"
+    try:
+        me = await context.bot.get_me()
+        versi_api = getattr(me, "api_version", None) or "ok"
+    except Exception:
+        pass
+    teks = (
+        rich_ui.rich_h2(f"{tgemoji('refresh', '🏓')} {BOT_DISPLAY} • STATUS") +
+        rich_ui.rich_info_table([
+            ["Uptime", f"<b>{jam}j {menit}m {detik}s</b>"],
+            ["Bot API", html.escape(str(versi_api))],
+            ["Engine", html.escape(str(versi_mark))],
+            ["Kecepatan", f"{speed['bulk_delay']}s / paralel "
+                          f"{speed['max_paralel']}"],
+            ["Mode koneksi", f"<b>{s['mode_proxy'].upper()}</b>"],
+            ["Auto-retry", f"{s['retry_maksimal']}x "
+                           f"({'aktif' if s['retry_gagal'] else 'mati'})"],
+            ["Force join",
+             f"{'AKTIF' if load_force_join()['enabled'] else 'MATI'} "
+             f"({len(load_force_join()['chats'])} link)"],
+        ])
+    )
+    await balas_rich(update, context, teks)
+
+
+# ==================== BERSIHKAN DATA ====================
+
+@owner_only
+@banned_guard
+async def bersih_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await balas(update, context,
+                "🧹 Bersihin file sementara...\n"
+                "• backup .zip lama\n"
+                "• __pycache__\n"
+                "• log_detek.jsonl (>30 hari)\n"
+                "• sesi_gagal.json",
+                reply_markup=_kb_ptb([[{"text": "✅ KONFIRMASI BERSIH",
+                                          "callback_data": "bersih_ya",
+                                          "style": "danger"},
+                                         {"text": "❌ BATAL",
+                                          "callback_data": "bersih_batal",
+                                          "style": "primary"}]]))
+
+
+@owner_only
+@banned_guard
+async def tombol_bersih(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.data == "bersih_batal":
+        await aman_answer(query, "Dibatalkan.")
+        try:
+            await query.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    dihapus = 0
+    for p in BASE_DIR.glob("backup_*.zip"):
+        try:
+            p.unlink()
+            dihapus += 1
+        except Exception:
+            pass
+    pc = BASE_DIR / "__pycache__"
+    if pc.is_dir():
+        import shutil as _sh
+        try:
+            _sh.rmtree(pc)
+            dihapus += 1
+        except Exception:
+            pass
+    try:
+        SESI_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+    if LOG_PATH.exists():
+        try:
+            lines = LOG_PATH.read_text(encoding="utf-8").splitlines()
+            batas = time.time() - 30 * 86400
+            baru = []
+            for l in lines:
+                try:
+                    r = json.loads(l)
+                    ts = datetime.strptime(r.get("ts", ""),
+                                           "%Y-%m-%d %H:%M:%S").timestamp()
+                    if ts >= batas:
+                        baru.append(l)
+                except Exception:
+                    continue
+            if len(baru) != len(lines):
+                LOG_PATH.write_text("\n".join(baru) + ("\n" if baru else ""),
+                                    encoding="utf-8")
+                dihapus += 1
+        except Exception:
+            pass
+    await aman_answer(query, "🧹 Selesai dibersihkan.")
+    await balas(update, context,
+                f"✅ Pembersihan selesai ({dihapus} item dibersihkan).")
+
+
+# ==================== TOMBOLO ULANGI GAGAL (USER) ====================
+
+@banned_guard
+async def tombol_ulang(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = update.effective_user
+
+    if force_join_aktif() and not is_owner(user.id):
+        belum = await cek_sudah_join(context, user.id)
+        if belum:
+            await aman_answer(query, "🔒 Join dulu ya!", show_alert=True)
+            return
+
+    sesi_id = (query.data or "").split("::", 1)[1] if "::" in (query.data or "") else ""
+    sesi = _ambil_sesi(user.id, sesi_id)
+    if not sesi:
+        await aman_answer(query, "⏳ Sesi sudah kedaluwarsa. Cek ulang manual ya.",
+                          show_alert=True)
+        return
+
+    asyncio.create_task(_ulangi_semua_gagal(update, context, user, sesi))
 
 
 # ==================== ERROR HANDLER ====================
